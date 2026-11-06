@@ -89,6 +89,7 @@ class LipschitzModel(nn.Module):
 
         self.layers = nn.Sequential(*layers) # Create the sequential model with the defined layers
         self.lipschitz_bound = lipschitz_bound  # Store the Lipschitz bound for later use
+        self.input_norm = input_norm  # Not visible in the layers or weights, so needed to tell stored results apart
         
     def forward(self, x):
         return self.layers(x)*self.lipschitz_bound  

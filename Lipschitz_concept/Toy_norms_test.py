@@ -11,6 +11,7 @@ from Toy_utils import REPORT_STYLE
 
 QUICK = False       # True: short training, only to check that everything runs
 PLOT_DIR = "Plots/Toy_norms"
+BATCH_SIZE = 8192   # points per training step
 
 
 def norm_scan():
@@ -49,7 +50,7 @@ def norm_scan():
 
             # Iterate through the seeds: train one network and measure it
             for seed in SEEDS:
-                job = dict(kind="lipschitz", seed=seed, steps=STEPS, lr=3e-3, x=x, y=base_gaussian.ravel(),
+                job = dict(kind="lipschitz", seed=seed, steps=STEPS, lr=3e-3, batch_size=BATCH_SIZE, x=x, y=base_gaussian.ravel(),
                            model_kwargs=dict(input_dim=N, hidden_dim=64, output_dim=1, n_groups=8, depth=5,
                                              lipschitz_bound=L_scaled, input_norm=norm))
                 prediction = train_one(job)["prediction"].reshape(base_gaussian.shape)

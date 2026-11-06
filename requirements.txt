@@ -5,6 +5,7 @@ matplotlib
 seaborn
 scipy
 scikit-learn
+threadpoolctl
 
 # Notebook support
 ipykernel

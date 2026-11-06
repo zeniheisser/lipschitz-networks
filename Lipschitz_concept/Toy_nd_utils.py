@@ -8,16 +8,16 @@
 # All Lipschitz constants, floors and measured slopes below use this norm, unless stated otherwise,
 # so that they are the right reference for the networks.
 import math
-import multiprocessing as mp
-import os
 
 import numpy as np
 import torch
 from scipy.interpolate import RegularGridInterpolator
 
+from job_runner import run_jobs
+from lipschitz_floor import _difference_matrix, _stencil_difference_matrix, _stencil_offsets
 from lipschitz_floor import lipschitz_floor_nd  # the floor (best L-Lipschitz fit) on an n-dimensional grid
 from models import LipschitzModel, UnconstrainedModel
-from Toy_utils import train_full_batch
+from Toy_utils import train_mini_batch
 
 
 ##### THE GAUSSIAN #####
@@ -174,10 +174,10 @@ def evaluate_with_gradient(model, x):
 
 def train_one(job):
     """
-    Trains one network with train_full_batch and evaluates it. job is a dictionary with
+    Trains one network with train_mini_batch and evaluates it. job is a dictionary with
         kind: "lipschitz" or "unconstrained",
         model_kwargs: the arguments of LipschitzModel or UnconstrainedModel,
-        seed, steps, lr,
+        seed, steps, lr, batch_size,
         x, y: training points and targets, numpy arrays of shape (N, n) and (N,),
         x_eval (optional): where to evaluate the trained network (default: x).
     Returns a dictionary with the prediction, shape (N_eval,), and the gradient, shape (N_eval, n), at x_eval.
@@ -187,25 +187,33 @@ def train_one(job):
     model = model_cls(**job["model_kwargs"])
     x = torch.tensor(job["x"], dtype=torch.float32)
     y = torch.tensor(job["y"], dtype=torch.float32).reshape(-1, 1)
-    train_full_batch(model, x, y, steps=job["steps"], lr=job["lr"])
+    train_mini_batch(model, x, y, job["batch_size"], steps=job["steps"], lr=job["lr"], seed=job["seed"])
     prediction, gradient = evaluate_with_gradient(model, job.get("x_eval", job["x"]))
     return {"prediction": prediction, "gradient": gradient}
-
-
-def _train_worker(job):
-    torch.set_num_threads(1)  # one core per network: as fast as sharing all cores, so they can run side by side
-    return train_one(job)
 
 
 def train_many(jobs, n_workers=None):
     """
     Runs train_one for every job in parallel, one process per network, and returns the results in the same order.
-    The jobs are independent, so a scan over L values and seeds trains about as fast as a single network.
+    At most job_runner.MAX_JOBS run at a time, and results that are already stored are not trained again.
     """
-    if n_workers is None:
-        n_workers = min(len(jobs), max(1, (os.cpu_count() or 2) - 1))
-    with mp.get_context("spawn").Pool(n_workers) as pool:
-        return pool.map(_train_worker, jobs)
+    return run_jobs(train_one, jobs, n_workers=n_workers, label="Training",
+                    depends_on=(train_mini_batch, evaluate_with_gradient, LipschitzModel, UnconstrainedModel))
+
+
+##### FLOORS #####
+def floor_one(job):
+    """lipschitz_floor_nd for a dictionary with its arguments. Returns (floor, MSE, info)."""
+    return lipschitz_floor_nd(**job, return_info=True)
+
+
+def floor_many(jobs, n_workers=None):
+    """
+    Runs floor_one for every job in parallel and returns the results in the same order. A job is a dictionary with y,
+    axes, L and optionally the other arguments of lipschitz_floor_nd. Results that are already stored are not solved again.
+    """
+    return run_jobs(floor_one, jobs, n_workers=n_workers, label="Floors",
+                    depends_on=(lipschitz_floor_nd, _difference_matrix, _stencil_difference_matrix, _stencil_offsets))
 
 
 ##### NOISE AND FOURIER SPECTRA #####

@@ -5,6 +5,8 @@ from torch.utils.data import Dataset
 import numpy as np
 import matplotlib.pyplot as plt
 
+from job_runner import cache_key, load_result, save_result
+
 
 ##### DATASET GENERATION #####
 def sine_function_train_data(N, frequency=1.0, seed=6):
@@ -118,7 +120,15 @@ def train_full_batch(model, x, y, steps=6000, lr=3e-3, noise_fn=None):
         If given, every training step uses the target y + noise_fn(), so the network sees a NEW noise realisation
         at every evaluation instead of one fixed realisation added to the data beforehand. Pass the CLEAN target as y.
     Returns the trained model.
+
+    The trained weights are stored on disk: the same model, starting weights, data and settings are not trained again.
     """
+    key = cache_key(train_full_batch, model, x, y, steps, lr)
+    stored_state = load_result(key)
+    if stored_state is not None:
+        model.load_state_dict(stored_state)
+        return model
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
     for _ in range(steps):
@@ -128,6 +138,39 @@ def train_full_batch(model, x, y, steps=6000, lr=3e-3, noise_fn=None):
         loss.backward()
         optimizer.step()
         scheduler.step()
+    save_result(key, model.state_dict())
+    return model
+
+
+def train_mini_batch(model, x, y, batch_size, steps=6000, lr=3e-3, seed=0):
+    """
+    The same training as train_full_batch (Adam, cosine learning rate schedule, MSE loss), but every step uses batch_size
+    random points, drawn with replacement. Used for the 2D grids, where a full batch is slow to train. Small batches
+    are not equivalent to a full batch: they copy less of the fine noise, and the difference shrinks as batch_size grows.
+    With batch_size or fewer points, every step uses all of them. The points are drawn with their own random numbers
+    from seed, so the training does not depend on or change the global random state.
+    Returns the trained model. The trained weights are stored on disk, as for train_full_batch.
+    """
+    key = cache_key(train_mini_batch, model, x, y, steps, lr, batch_size, seed)
+    stored_state = load_result(key)
+    if stored_state is not None:
+        model.load_state_dict(stored_state)
+        return model
+
+    generator = torch.Generator().manual_seed(seed)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
+    for _ in range(steps):
+        optimizer.zero_grad()
+        if batch_size < len(x):
+            batch = torch.randint(len(x), (batch_size,), generator=generator)
+            loss = ((model(x[batch]) - y[batch]) ** 2).mean()
+        else:
+            loss = ((model(x) - y) ** 2).mean()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+    save_result(key, model.state_dict())
     return model
 
 
