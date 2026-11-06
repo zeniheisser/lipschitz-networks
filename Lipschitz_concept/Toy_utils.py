@@ -109,21 +109,52 @@ def FWHM_calculation(x, f):
 
 
 ###### TRAINING ######
-def train_full_batch(model, x, y, steps=6000, lr=3e-3):
+def train_full_batch(model, x, y, steps=6000, lr=3e-3, noise_fn=None):
     """
     Plain full-batch training with Adam, a cosine learning rate schedule and MSE loss.
     Used for the small 1D robustness tests, where the whole data set fits in one batch.
+
+    noise_fn (optional): a function without arguments that returns a fresh noise tensor with the shape of y.
+        If given, every training step uses the target y + noise_fn(), so the network sees a NEW noise realisation
+        at every evaluation instead of one fixed realisation added to the data beforehand. Pass the CLEAN target as y.
     Returns the trained model.
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
     for _ in range(steps):
         optimizer.zero_grad()
-        loss = ((model(x) - y) ** 2).mean()
+        target = y if noise_fn is None else y + noise_fn()
+        loss = ((model(x) - target) ** 2).mean()
         loss.backward()
         optimizer.step()
         scheduler.step()
     return model
+
+
+def white_noise_sampler(shape, std, seed=0):
+    """
+    Returns a function that draws a new white noise tensor (independent Gaussian, standard deviation std) of the given
+    shape every time it is called. It has its own random generator, so the noise sequence is reproducible from the seed
+    and does not change the random numbers used for the network weights.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    return lambda: std * torch.randn(shape, generator=generator)
+
+
+def sine_noise_sampler(x, amplitudes, frequencies, seed=0):
+    """
+    Returns a function that draws new sine-wave noise sum_j A_j sin(omega_j x + phi_j) on the points x (tensor of shape
+    (N, 1)) every time it is called, with new random phases phi_j each call. The frequencies and amplitudes stay fixed,
+    so every draw has the same spectrum as the fixed sine noise, but the noise averages to zero over many draws.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    amplitudes = torch.tensor(amplitudes, dtype=x.dtype)
+    frequencies = torch.tensor(frequencies, dtype=x.dtype)
+
+    def sample():
+        phases = 2 * np.pi * torch.rand(len(frequencies), generator=generator, dtype=x.dtype)
+        return (amplitudes * torch.sin(x * frequencies + phases)).sum(dim=-1, keepdim=True)
+    return sample
 
 
 ###### NOISE AND FOURIER SPECTRA ######
