@@ -111,29 +111,30 @@ def FWHM_calculation(x, f):
 
 
 ###### TRAINING ######
-def train_full_batch(model, x, y, steps=6000, lr=3e-3, noise_fn=None):
+def train_full_batch(model, x, y, steps=6000, lr=3e-3, noise=None):
     """
     Plain full-batch training with Adam, a cosine learning rate schedule and MSE loss.
     Used for the small 1D robustness tests, where the whole data set fits in one batch.
 
-    noise_fn (optional): a function without arguments that returns a fresh noise tensor with the shape of y.
-        If given, every training step uses the target y + noise_fn(), so the network sees a NEW noise realisation
-        at every evaluation instead of one fixed realisation added to the data beforehand. Pass the CLEAN target as y.
+    noise (optional): a noise description for noise_sampler, e.g. dict(kind="white", std=0.1, seed=0).
+        If given, every training step uses the target y + a NEW noise draw, so the network sees fresh noise at every
+        evaluation instead of one fixed realisation added to the data beforehand. Pass the CLEAN target as y.
     Returns the trained model.
 
     The trained weights are stored on disk: the same model, starting weights, data and settings are not trained again.
     """
-    key = cache_key(train_full_batch, model, x, y, steps, lr)
+    key = cache_key(train_full_batch, model, x, y, steps, lr, noise, noise_sampler)
     stored_state = load_result(key)
     if stored_state is not None:
         model.load_state_dict(stored_state)
         return model
 
+    sample_noise = None if noise is None else noise_sampler(noise)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
     for _ in range(steps):
         optimizer.zero_grad()
-        target = y if noise_fn is None else y + noise_fn()
+        target = y if sample_noise is None else y + sample_noise(x)
         loss = ((model(x) - target) ** 2).mean()
         loss.backward()
         optimizer.step()
@@ -142,31 +143,37 @@ def train_full_batch(model, x, y, steps=6000, lr=3e-3, noise_fn=None):
     return model
 
 
-def train_mini_batch(model, x, y, batch_size, steps=6000, lr=3e-3, seed=0):
+def train_mini_batch(model, x, y, batch_size, steps=6000, lr=3e-3, seed=0, noise=None):
     """
     The same training as train_full_batch (Adam, cosine learning rate schedule, MSE loss), but every step uses batch_size
     random points, drawn with replacement. Used for the 2D grids, where a full batch is slow to train. Small batches
     are not equivalent to a full batch: they copy less of the fine noise, and the difference shrinks as batch_size grows.
     With batch_size or fewer points, every step uses all of them. The points are drawn with their own random numbers
     from seed, so the training does not depend on or change the global random state.
+    noise (optional): as in train_full_batch. A new noise draw is added at the points of every batch, so every point
+    gets new noise each time it is used. Pass the CLEAN target as y.
     Returns the trained model. The trained weights are stored on disk, as for train_full_batch.
     """
-    key = cache_key(train_mini_batch, model, x, y, steps, lr, batch_size, seed)
+    key = cache_key(train_mini_batch, model, x, y, steps, lr, batch_size, seed, noise, noise_sampler)
     stored_state = load_result(key)
     if stored_state is not None:
         model.load_state_dict(stored_state)
         return model
 
     generator = torch.Generator().manual_seed(seed)
+    sample_noise = None if noise is None else noise_sampler(noise)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
     for _ in range(steps):
         optimizer.zero_grad()
         if batch_size < len(x):
             batch = torch.randint(len(x), (batch_size,), generator=generator)
-            loss = ((model(x[batch]) - y[batch]) ** 2).mean()
+            x_batch, y_batch = x[batch], y[batch]
         else:
-            loss = ((model(x) - y) ** 2).mean()
+            x_batch, y_batch = x, y
+        if sample_noise is not None:
+            y_batch = y_batch + sample_noise(x_batch)
+        loss = ((model(x_batch) - y_batch) ** 2).mean()
         loss.backward()
         optimizer.step()
         scheduler.step()
@@ -174,30 +181,32 @@ def train_mini_batch(model, x, y, batch_size, steps=6000, lr=3e-3, seed=0):
     return model
 
 
-def white_noise_sampler(shape, std, seed=0):
+def noise_sampler(noise):
     """
-    Returns a function that draws a new white noise tensor (independent Gaussian, standard deviation std) of the given
-    shape every time it is called. It has its own random generator, so the noise sequence is reproducible from the seed
-    and does not change the random numbers used for the network weights.
+    Returns a function sample(x) that draws NEW noise at the points x (tensor of shape (N, n)) every time it is called,
+    as a tensor of shape (N, 1). noise is a dictionary (a plain description, so trainings can be stored and run in
+    other processes):
+        dict(kind="white", std=s, seed=...)
+            independent Gaussian noise with standard deviation s at every point, new at every call.
+        dict(kind="waves", amplitudes=[A_1, ...], wavevectors=[k_1, ...], seed=...)
+            plane waves sum_j A_j sin(k_j . x + phi_j) with new random phases phi_j at every call (in 1D, k_j = [omega_j]).
+            Every draw has the same spectrum as the fixed waves, but the waves average to zero over many draws.
+    The noise has its own random generator, seeded from seed, so it is reproducible and does not change the random
+    numbers used for the network weights or the batches.
     """
-    generator = torch.Generator().manual_seed(seed)
-    return lambda: std * torch.randn(shape, generator=generator)
+    generator = torch.Generator().manual_seed(int(noise.get("seed", 0)))
+    if noise["kind"] == "white":
+        std = float(noise["std"])
+        return lambda x: std * torch.randn(len(x), 1, generator=generator, dtype=x.dtype)
+    if noise["kind"] == "waves":
+        amplitudes = torch.tensor(np.asarray(noise["amplitudes"], dtype=float), dtype=torch.float32)
+        wavevectors = torch.tensor(np.asarray(noise["wavevectors"], dtype=float), dtype=torch.float32)  # (J, n)
 
-
-def sine_noise_sampler(x, amplitudes, frequencies, seed=0):
-    """
-    Returns a function that draws new sine-wave noise sum_j A_j sin(omega_j x + phi_j) on the points x (tensor of shape
-    (N, 1)) every time it is called, with new random phases phi_j each call. The frequencies and amplitudes stay fixed,
-    so every draw has the same spectrum as the fixed sine noise, but the noise averages to zero over many draws.
-    """
-    generator = torch.Generator().manual_seed(seed)
-    amplitudes = torch.tensor(amplitudes, dtype=x.dtype)
-    frequencies = torch.tensor(frequencies, dtype=x.dtype)
-
-    def sample():
-        phases = 2 * np.pi * torch.rand(len(frequencies), generator=generator, dtype=x.dtype)
-        return (amplitudes * torch.sin(x * frequencies + phases)).sum(dim=-1, keepdim=True)
-    return sample
+        def sample(x):
+            phases = 2 * np.pi * torch.rand(len(amplitudes), generator=generator)
+            return (amplitudes * torch.sin(x @ wavevectors.T.to(x.dtype) + phases)).sum(dim=-1, keepdim=True)
+        return sample
+    raise ValueError(f"Unknown noise kind {noise['kind']!r}")
 
 
 ###### NOISE AND FOURIER SPECTRA ######
