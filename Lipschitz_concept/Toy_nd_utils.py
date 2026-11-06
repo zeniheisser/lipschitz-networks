@@ -17,7 +17,7 @@ from job_runner import run_jobs
 from lipschitz_floor import _difference_matrix, _stencil_difference_matrix, _stencil_offsets
 from lipschitz_floor import lipschitz_floor_nd  # the floor (best L-Lipschitz fit) on an n-dimensional grid
 from models import LipschitzModel, UnconstrainedModel
-from Toy_utils import train_mini_batch
+from Toy_utils import noise_sampler, train_mini_batch
 
 
 ##### THE GAUSSIAN #####
@@ -179,7 +179,8 @@ def train_one(job):
         model_kwargs: the arguments of LipschitzModel or UnconstrainedModel,
         seed, steps, lr, batch_size,
         x, y: training points and targets, numpy arrays of shape (N, n) and (N,),
-        x_eval (optional): where to evaluate the trained network (default: x).
+        x_eval (optional): where to evaluate the trained network (default: x),
+        noise (optional): fresh noise at every step, see Toy_utils.noise_sampler. y is then the CLEAN target.
     Returns a dictionary with the prediction, shape (N_eval,), and the gradient, shape (N_eval, n), at x_eval.
     """
     torch.manual_seed(job["seed"])
@@ -187,7 +188,8 @@ def train_one(job):
     model = model_cls(**job["model_kwargs"])
     x = torch.tensor(job["x"], dtype=torch.float32)
     y = torch.tensor(job["y"], dtype=torch.float32).reshape(-1, 1)
-    train_mini_batch(model, x, y, job["batch_size"], steps=job["steps"], lr=job["lr"], seed=job["seed"])
+    train_mini_batch(model, x, y, job["batch_size"], steps=job["steps"], lr=job["lr"], seed=job["seed"],
+                     noise=job.get("noise"))
     prediction, gradient = evaluate_with_gradient(model, job.get("x_eval", job["x"]))
     return {"prediction": prediction, "gradient": gradient}
 
@@ -198,7 +200,7 @@ def train_many(jobs, n_workers=None):
     At most job_runner.MAX_JOBS run at a time, and results that are already stored are not trained again.
     """
     return run_jobs(train_one, jobs, n_workers=n_workers, label="Training",
-                    depends_on=(train_mini_batch, evaluate_with_gradient, LipschitzModel, UnconstrainedModel))
+                    depends_on=(train_mini_batch, noise_sampler, evaluate_with_gradient, LipschitzModel, UnconstrainedModel))
 
 
 ##### FLOORS #####
